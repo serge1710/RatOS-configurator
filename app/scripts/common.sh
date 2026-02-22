@@ -2,7 +2,7 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "$(realpath -- "${BASH_SOURCE[0]}")" )" &> /dev/null && pwd )
 
 # shellcheck source=./configuration/scripts/environment.sh
-source "$SCRIPT_DIR"/environment.sh
+source "$SCRIPT_DIR"/configuration/scripts/environment.sh
 
 # Helper to conditionally use sudo (for compatibility with systemd-nspawn/containers)
 # When running as root (EUID=0), commands are executed directly
