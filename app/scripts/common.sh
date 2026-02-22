@@ -1,557 +1,396 @@
 #!/usr/bin/env bash
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-SRC_DIR=$(realpath "$SCRIPT_DIR/..")
-BASE_DIR=$(realpath "$SRC_DIR/..")
-GIT_DIR=$BASE_DIR/.git
+SCRIPT_DIR=$( cd -- "$( dirname -- "$(realpath -- "${BASH_SOURCE[0]}")" )" &> /dev/null && pwd )
 
-source "$BASE_DIR/configuration/scripts/environment.sh"
+# shellcheck source=./configuration/scripts/environment.sh
+source "$SCRIPT_DIR"/environment.sh
+
+# Helper to conditionally use sudo (for compatibility with systemd-nspawn/containers)
+# When running as root (EUID=0), commands are executed directly
+# When not root, sudo is used for privilege escalation
+if [ "$EUID" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# Helper to run commands as a specific user
+# Only uses sudo -u if we're not already running as the target user
+run_as_user() {
+    local username="$1"
+    shift
+	# If running as root or as a different user, use sudo -u
+	if [ "$EUID" -eq 0 ] || [ "$(whoami)" != "$username" ]; then
+        # Need to switch users, use sudo -u
+        sudo -u "$username" "$@"
+    else
+        # Already the target user, run directly
+        "$@"
+    fi
+}
+
+# System package requirements for RatOS (read by Moonraker and scripts)
+# shellcheck disable=SC2034
+PKGLIST="python3-numpy python3-matplotlib curl git libopenblas-base"
 
 report_status()
 {
     echo -e "\n\n###### $1"
 }
 
-update_package_managers()
+disable_modem_manager()
 {
-    report_status "Updating npm and pnpm..."
-    npm update -g npm pnpm
-}
-
-install_or_update_service_file()
-{
-	report_status "Updating service file..."
-
-    sudo groupadd -f ratos-configurator
-
-	SERVICE_FILE="/etc/systemd/system/ratos-configurator.service"
-	SERVICE_FILE_TEMPLATE="${SCRIPT_DIR}/service-template.service"
-
-	cp "${SERVICE_FILE_TEMPLATE}" /tmp/ratos-configurator.service
+	report_status "Checking if ModemManager is enabled..."
 	
-	sed -i "s|__SRC_DIR__|${SRC_DIR}|g" /tmp/ratos-configurator.service
-	sed -i "s|__RATOS_USERNAME__|${RATOS_USERNAME}|g" /tmp/ratos-configurator.service
-	
-	if [ -f "${SERVICE_FILE}" ]; then
-		if [ "$(md5sum "${SERVICE_FILE_TEMPLATE}")" != "$(md5sum "${SERVICE_FILE}")" ]; then
-			sudo mv /tmp/ratos-configurator.service "${SERVICE_FILE}"
-			sudo systemctl daemon-reload
-			echo "Service file updated!"
-		else
-			echo "Service file is already up to date!"
-		fi
+	if ! $SUDO systemctl is-enabled ModemManager.service &> /dev/null; then
+		report_status "Disabling ModemManager..."
+		$SUDO systemctl disable ModemManager.service
 	else
-		echo "Service file does not exist, installing..."
-		sudo mv /tmp/ratos-configurator.service "${SERVICE_FILE}"
-		sudo systemctl enable ratos-configurator.service
-		sudo systemctl daemon-reload
-		echo "Service file installed!"
+		report_status "ModemManager is already disabled.."
 	fi
+	report_status "Masking ModemManager to ensure it won't start in the future..."
+	$SUDO systemctl mask ModemManager.service
 }
 
-pnpm_install() {
-	report_status "Installing pnpm dependencies..."
-    pushd "$SRC_DIR" || exit 1
-	if [ -d "$BASE_DIR/node_modules" ]; then
-		report_status "Moving node_modules from git directory to src directory"
-		mv "$BASE_DIR/node_modules" "$SRC_DIR"
-	fi
-	if [ "$EUID" -eq 0 ]; then
-		# Check if node_modules is owned by root and delete
-		# Fixes old 2.0 installations
-		if [ -d "$SRC_DIR/node_modules" ] && [ "$(stat -c %U "$SRC_DIR/node_modules")" == "root" ]; then
-			report_status "Deleting root owned node_modules"
-			rm -rf "$SRC_DIR/node_modules"
-		fi
-        sudo -u "${RATOS_USERNAME}" pnpm install --frozen-lockfile --aggregate-output --no-color --config.confirmModulesPurge=false
-    else
-		pnpm install --frozen-lockfile --aggregate-output --no-color --config.confirmModulesPurge=false
-	fi
-    popd || exit 1
-}
-
-ensure_pnpm_installation() {
-	if ! which pnpm &> /dev/null; then
-		report_status "Installing pnpm"
-		npm install -g pnpm
-		# remove old node modules
-		rm -rf "$SRC_DIR/node_modules"
-		pnpm_install
-	fi
-}
-
-ensure_service_permission()
+update_beacon_fw()
 {
-	if ! grep -q "ratos-configurator" "${RATOS_PRINTER_DATA_DIR}/moonraker.asvc"; then
-		report_status "Updatin moonraker service permissions"
-		printf '\nratos-configurator' >> "${RATOS_PRINTER_DATA_DIR}/moonraker.asvc"
-		echo "RatOS added to moonraker service permissions!"
+	report_status "Updating beacon firmware..."
+	if [ ! -d "$BEACON_DIR" ] || [ ! -e "$KLIPPER_DIR/klippy/extras/beacon.py" ]; then
+		echo "beacon: beacon isn't installed, skipping..."
+		return
+	fi
+
+	if [ ! -d "$KLIPPER_DIR" ] || [ ! -d "$KLIPPER_ENV" ]; then
+		echo "beacon: klipper or klippy env doesn't exist"
+		return
+	fi
+
+	if [ ! -f "$BEACON_DIR/update_firmware.py" ]; then
+		echo "beacon: beacon firmware updater script doesn't exist, skipping..."
+		return
+	fi
+
+	if [ ! -d /sys/bus/usb/devices ]; then
+		echo "beacon: no usb devices present, skipping firmware update..."
+		return
+	fi
+
+	"$KLIPPER_ENV"/bin/python "$BEACON_DIR"/update_firmware.py update all --no-sudo
+}
+
+install_beacon()
+{
+    report_status "Installing beacon module..."
+
+	if [ -d "$BEACON_DIR" ] || [ -e "$KLIPPER_DIR/klippy/extras/beacon.py" ]; then
+		echo "beacon: beacon already installed, skipping..."
+		return
+	fi
+
+	if [ ! -d "$KLIPPER_DIR" ] || [ ! -d "$KLIPPER_ENV" ]; then
+		echo "beacon: klipper or klippy env doesn't exist"
+		return
+	fi
+
+	git clone https://github.com/beacon3d/beacon_klipper.git "$BEACON_DIR"
+	chown -R "${RATOS_USERNAME}:${RATOS_USERGROUP}" "$BEACON_DIR"
+
+	# install beacon requirements to env
+	echo "beacon: installing python requirements to env."
+	if [ "$EUID" -eq 0 ]; then
+		# Running as root, use su to run pip as the correct user
+		su - "${RATOS_USERNAME}" -c "\"${KLIPPER_ENV}\"/bin/pip install -r \"${BEACON_DIR}\"/requirements.txt"
+	else
+		# Running as user, can run pip directly
+		"${KLIPPER_ENV}"/bin/pip install -r "${BEACON_DIR}"/requirements.txt
+	fi
+
+	# Beacon extension will be registered in verify_registered_extensions
+}
+
+regenerate_config() {
+    report_status "Regenerating RatOS configuration via RatOS Configurator..."
+
+    ratos config regenerate
+}
+
+remove_old_postprocessor()
+{
+	if [ -L "${KLIPPER_DIR}/klippy/extras/ratos_post_processor.py" ]; then
+		report_status "Removing legacy post-processor..."
+		rm "${KLIPPER_DIR}/klippy/extras/ratos_post_processor.py"
+		echo "Legacy post-processor removed!"
 	fi
 }
 
 install_hooks()
 {
-    report_status "Installing git hooks"
-	if [ -L "$GIT_DIR/hooks/post-merge" ]; then
- 	   rm "$GIT_DIR/hooks/post-merge"
-	fi
-	ln -s "$SCRIPT_DIR/post-merge.sh" "$GIT_DIR/hooks/post-merge"
-	echo "Post-merge git-hook installed!"
-}
-
-install_logrotation() {
-    LOGROTATE_FILE="/etc/logrotate.d/ratos-configurator"
-    LOGFILE="${RATOS_PRINTER_DATA_DIR}/logs/ratos-configurator.log"
-    report_status "Installing RatOS Configurator log rotation script..."
-    sudo /bin/sh -c "cat > ${LOGROTATE_FILE}" << __EOF
-#### RatOS-configurator
-####
-#### Written by Mikkel Schmidt <mikkel.schmidt@gmail.com>
-#### Copyright 2022
-#### https://github.com/Rat-OS/RatOS-Configurator
-####
-#### This File is distributed under GPLv3
-####
-
-
-${LOGFILE} {
-    rotate 3
-    missingok
-    notifempty
-    copy
-    daily
-    dateext
-    dateformat .%Y-%m-%d
-    maxsize 10M
-}
-__EOF
-    sudo chmod 644 "$LOGROTATE_FILE"
-}
-
-patch_log_rotation() {
-	if [ -e /etc/logrotate.d/ratos-configurator ]; then
-		if grep -q "${RATOS_PRINTER_DATA_DIR}/logs/ratos-configurator.log" /etc/logrotate.d/ratos-configurator; then
-			report_status "Patching log rotation"
-			sudo sed -i 's|rotate 4|rotate 3|g' /etc/logrotate.d/ratos-configurator
-			sudo sed -i "s|${RATOS_PRINTER_DATA_DIR}/logs/configurator.log|${RATOS_PRINTER_DATA_DIR}/logs/ratos-configurator.log|g" /etc/logrotate.d/ratos-configurator
-		fi
-	else
-		install_logrotation
-	fi
-}
-
-symlink_configuration() {
-	report_status "Symlinking configuration"
-	[ -z "$RATOS_PRINTER_DATA_DIR" ] && { echo "Error: RATOS_PRINTER_DATA_DIR not set" >&2; return 1; }
-	[ -z "$BASE_DIR" ] && { echo "Error: BASE_DIR not set" >&2; return 1; }
-	
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-	
-	target="${RATOS_PRINTER_DATA_DIR}/config/RatOS"
-	source="$BASE_DIR/configuration"
-	if [ ! -L "$target" ] || [ ! "$(readlink "$target")" = "$source" ]; then
-		$sudo rm -rf "$target" || { echo "Failed to remove old configuration" >&2; return 1; }
-		$sudo ln -s "$source" "$target" || { echo "Failed to create symlink" >&2; return 1; }
-		echo "Configuration symlink created successfully"
-	else
-		echo "Configuration already linked, skipping..."
-	fi
-}
-
-install_cli()
-{
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-	
-	target="/usr/local/bin/ratos"
-	source="$SRC_DIR/bin/ratos"
-	if [ ! -L "$target" ] || [ ! "$(readlink "$target")" = "$source" ]; then
-		report_status "Installing RatOS CLI"
-		$sudo rm -f "$target"
-		$sudo ln -s "$source" "$target"
-		$sudo chmod a+x "$target"
-	else
-		echo "RatOS CLI already installed, skipping..."
-	fi
-}
-
-verify_users()
-{
-	if ! id "${RATOS_USERNAME}" &>/dev/null; then
-		echo "User ${RATOS_USERNAME} is not present on the system"
-		exit 1
-	fi
-}
-
-install_udev_rule()
-{
-
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-
-	ratos_source="$SCRIPT_DIR/ratos.rules"
-	ratos_target="/etc/udev/rules.d/97-ratos.rules"
-	if [ ! -f "$ratos_source" ]; then
-		echo "Error: RatOS udev rules source file not found at $ratos_source" >&2
-		return 1
-	fi
-	if [ ! -L "$ratos_target" ] || [ ! "$(readlink "$ratos_target")" = "$ratos_source" ]; then
-		report_status "Installing RatOS udev rule"
-		$sudo rm -f "$ratos_target"
-		$sudo ln -s "$ratos_source" "$ratos_target"
-		echo "RatOS udev rule installed!"
-	fi
-
-	vaoc_source="$SCRIPT_DIR/vaoc.rules" 
-	vaoc_target="/etc/udev/rules.d/97-vaoc.rules"
-	if [ ! -f "$vaoc_source" ]; then
-		echo "Error: VAOC udev rules source file not found at $vaoc_source" >&2
-		return 1
-	fi
-	if [ ! -L "$vaoc_target" ] || [ ! "$(readlink "$vaoc_target")" = "$vaoc_source" ]; then
-		report_status "Installing VAOC udev rule"
-		$sudo rm -f "$vaoc_target"
-		$sudo ln -s "$vaoc_source" "$vaoc_target"
-		echo "VAOC udev rule installed!"
-	fi
-}
-
-ensure_sudo_command_whitelisting()
-{
-
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-
-    report_status "Updating whitelisted commands"
-	# Whitelist RatOS configurator git hook scripts
-	if [[ -e /etc/sudoers.d/030-ratos-configurator-githooks ]]
+    report_status "Verifying git hooks are installed..."
+	# Klipper hook
+	klipper_source="$SCRIPT_DIR/klipper-post-merge.sh"
+	klipper_target="${KLIPPER_DIR}/.git/hooks/post-merge"
+	if [[ ! -L "$klipper_target" ]] || [[ ! "$(readlink "$klipper_target")" = "$klipper_source" ]]
 	then
-		$sudo rm /etc/sudoers.d/030-ratos-configurator-githooks
+		rm -f "$klipper_target"
+		ln -s "$klipper_source" "$klipper_target"
+		echo "Klipper git hook installed!"
 	fi
-	touch /tmp/030-ratos-configurator-githooks
-	cat << __EOF > /tmp/030-ratos-configurator-githooks
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/update.sh
-__EOF
 
-	$sudo chown root:root /tmp/030-ratos-configurator-githooks
-	$sudo chmod 440 /tmp/030-ratos-configurator-githooks
-	$sudo cp --preserve=mode /tmp/030-ratos-configurator-githooks /etc/sudoers.d/030-ratos-configurator-githooks
-
-	echo "RatOS configurator git hooks has successfully been whitelisted!"
-
-	# Whitelist configurator scripts
-	if [[ -e /etc/sudoers.d/030-ratos-configurator-scripts ]]
+	# Moonraker hook
+	moonraker_source="$SCRIPT_DIR/moonraker-post-merge.sh"
+	moonraker_target="${MOONRAKER_DIR}/.git/hooks/post-merge"
+	if [[ ! -L "$moonraker_target" ]] || [[ ! "$(readlink "$moonraker_target")" = "$moonraker_source" ]]
 	then
-		$sudo rm /etc/sudoers.d/030-ratos-configurator-scripts
+		rm -f "$moonraker_target"
+		ln -s "$moonraker_source" "$moonraker_target"
+		echo "Moonraker git hook installed!"
 	fi
-	touch /tmp/030-ratos-configurator-scripts
-	cat << __EOF > /tmp/031-ratos-configurator-scripts
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/add-wifi-network.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/change-hostname.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/dfu-flash.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/board-script.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/flash-path.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/klipper-compile.sh
-__EOF
 
-	$sudo chown root:root /tmp/031-ratos-configurator-scripts
-	$sudo chmod 440 /tmp/031-ratos-configurator-scripts
-	$sudo cp --preserve=mode /tmp/031-ratos-configurator-scripts /etc/sudoers.d/031-ratos-configurator-scripts
-
-	echo "RatOS configurator scripts has successfully been whitelisted!"
-
-	# Whitelist configurator commands
-	if [[ -e /etc/sudoers.d/031-ratos-configurator-wifi ]]
+	# Beacon hook
+	beacon_source="$SCRIPT_DIR/beacon-post-merge.sh"
+	beacon_target="${BEACON_DIR}/.git/hooks/post-merge"
+	if [[ ! -L "$beacon_target" ]] || [[ ! "$(readlink "$beacon_target")" = "$beacon_source" ]]
 	then
-		$sudo rm /etc/sudoers.d/031-ratos-configurator-wifi
+		rm -f "$beacon_target"
+		ln -s "$beacon_source" "$beacon_target"
+		echo "Beacon git hook installed!"
 	fi
-	touch /tmp/031-ratos-configurator-wifi
-	cat << __EOF > /tmp/031-ratos-configurator-wifi
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: /usr/sbin/iw
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli
-__EOF
-
-	$sudo chown root:root /tmp/031-ratos-configurator-wifi
-	$sudo chmod 440 /tmp/031-ratos-configurator-wifi
-	$sudo cp --preserve=mode /tmp/031-ratos-configurator-wifi /etc/sudoers.d/031-ratos-configurator-wifi
-
-	echo "RatOS configurator commands has successfully been whitelisted!"
-}#!/usr/bin/env bash
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-SRC_DIR=$(realpath "$SCRIPT_DIR/..")
-BASE_DIR=$(realpath "$SRC_DIR/..")
-GIT_DIR=$BASE_DIR/.git
-
-source "$BASE_DIR/configuration/scripts/environment.sh"
-
-report_status()
-{
-    echo -e "\n\n###### $1"
-}
-
-update_package_managers()
-{
-    report_status "Updating npm and pnpm..."
-    npm update -g npm pnpm
-}
-
-install_or_update_service_file()
-{
-	report_status "Updating service file..."
-
-    sudo groupadd -f ratos-configurator
-
-	SERVICE_FILE="/etc/systemd/system/ratos-configurator.service"
-	SERVICE_FILE_TEMPLATE="${SCRIPT_DIR}/service-template.service"
-
-	cp "${SERVICE_FILE_TEMPLATE}" /tmp/ratos-configurator.service
-	
-	sed -i "s|__SRC_DIR__|${SRC_DIR}|g" /tmp/ratos-configurator.service
-	sed -i "s|__RATOS_USERNAME__|${RATOS_USERNAME}|g" /tmp/ratos-configurator.service
-	
-	if [ -f "${SERVICE_FILE}" ]; then
-		if [ "$(md5sum "${SERVICE_FILE_TEMPLATE}")" != "$(md5sum "${SERVICE_FILE}")" ]; then
-			sudo mv /tmp/ratos-configurator.service "${SERVICE_FILE}"
-			sudo systemctl daemon-reload
-			echo "Service file updated!"
-		else
-			echo "Service file is already up to date!"
-		fi
-	else
-		echo "Service file does not exist, installing..."
-		sudo mv /tmp/ratos-configurator.service "${SERVICE_FILE}"
-		sudo systemctl enable ratos-configurator.service
-		sudo systemctl daemon-reload
-		echo "Service file installed!"
-	fi
-}
-
-pnpm_install() {
-	report_status "Installing pnpm dependencies..."
-    pushd "$SRC_DIR" || exit 1
-	if [ -d "$BASE_DIR/node_modules" ]; then
-		report_status "Moving node_modules from git directory to src directory"
-		mv "$BASE_DIR/node_modules" "$SRC_DIR"
-	fi
-	if [ "$EUID" -eq 0 ]; then
-		# Check if node_modules is owned by root and delete
-		# Fixes old 2.0 installations
-		if [ -d "$SRC_DIR/node_modules" ] && [ "$(stat -c %U "$SRC_DIR/node_modules")" == "root" ]; then
-			report_status "Deleting root owned node_modules"
-			rm -rf "$SRC_DIR/node_modules"
-		fi
-        sudo -u "${RATOS_USERNAME}" pnpm install --frozen-lockfile --aggregate-output --no-color --config.confirmModulesPurge=false
-    else
-		pnpm install --frozen-lockfile --aggregate-output --no-color --config.confirmModulesPurge=false
-	fi
-    popd || exit 1
-}
-
-ensure_pnpm_installation() {
-	if ! which pnpm &> /dev/null; then
-		report_status "Installing pnpm"
-		npm install -g pnpm
-		# remove old node modules
-		rm -rf "$SRC_DIR/node_modules"
-		pnpm_install
-	fi
+	echo "Git hooks are correctly installed!"
 }
 
 ensure_service_permission()
 {
-	if ! grep -q "ratos-configurator" "${RATOS_PRINTER_DATA_DIR}/moonraker.asvc"; then
-		report_status "Updatin moonraker service permissions"
-		printf '\nratos-configurator' >> "${RATOS_PRINTER_DATA_DIR}/moonraker.asvc"
-		echo "RatOS added to moonraker service permissions!"
-	fi
+    report_status "Ensuring moonraker service permissions..."
+    
+    local asvc_file="${RATOS_PRINTER_DATA_DIR}/moonraker.asvc"
+    
+    # Define required service entries
+    local required_services=(
+        "klipper_mcu"
+        "webcamd"
+        "MoonCord"
+        "KlipperScreen"
+        "moonraker-telegram-bot"
+        "moonraker-obico"
+        "sonar"
+        "crowsnest"
+        "octoeverywhere"
+        "ratos-configurator"
+    )
+    
+    # Create file if it doesn't exist
+    if [ ! -e "$asvc_file" ]; then
+        touch "$asvc_file"
+        echo "Created moonraker service permissions file"
+    fi
+    
+    # Ensure file ends with newline if it has content
+    if [ -s "$asvc_file" ] && [ "$(tail -c 1 "$asvc_file" 2>/dev/null | wc -l)" -eq 0 ]; then
+        echo "" >> "$asvc_file"
+    fi
+    
+    # Check for missing entries and add them
+    local added_count=0
+    for service in "${required_services[@]}"; do
+        # Check if service exists in file (ignoring leading/trailing whitespace)
+        # Use awk to trim whitespace from each line and compare
+        if ! awk -v service="$service" 'BEGIN {found=0} {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if ($0 == service) found=1} END {exit !found}' "$asvc_file" 2>/dev/null; then
+            echo "$service" >> "$asvc_file"
+            echo "Added service permission: $service"
+            ((added_count++))
+        fi
+    done
+    
+    # Ensure correct ownership if running as root
+    if [ "$EUID" -eq 0 ]; then
+        chown "${RATOS_USERNAME}:${RATOS_USERGROUP}" "$asvc_file"
+    fi
+    
+    if [ "$added_count" -gt 0 ]; then
+        echo "Added $added_count service permission(s) to moonraker.asvc"
+    else
+        echo "All required service permissions already present"
+    fi
 }
 
-install_hooks()
+patch_klipperscreen_service_restarts()
 {
-    report_status "Installing git hooks"
-	if [ -L "$GIT_DIR/hooks/post-merge" ]; then
- 	   rm "$GIT_DIR/hooks/post-merge"
-	fi
-	ln -s "$SCRIPT_DIR/post-merge.sh" "$GIT_DIR/hooks/post-merge"
-	echo "Post-merge git-hook installed!"
-}
-
-install_logrotation() {
-    LOGROTATE_FILE="/etc/logrotate.d/ratos-configurator"
-    LOGFILE="${RATOS_PRINTER_DATA_DIR}/logs/ratos-configurator.log"
-    report_status "Installing RatOS Configurator log rotation script..."
-    sudo /bin/sh -c "cat > ${LOGROTATE_FILE}" << __EOF
-#### RatOS-configurator
-####
-#### Written by Mikkel Schmidt <mikkel.schmidt@gmail.com>
-#### Copyright 2022
-#### https://github.com/Rat-OS/RatOS-Configurator
-####
-#### This File is distributed under GPLv3
-####
-
-
-${LOGFILE} {
-    rotate 3
-    missingok
-    notifempty
-    copy
-    daily
-    dateext
-    dateformat .%Y-%m-%d
-    maxsize 10M
-}
-__EOF
-    sudo chmod 644 "$LOGROTATE_FILE"
-}
-
-patch_log_rotation() {
-	if [ -e /etc/logrotate.d/ratos-configurator ]; then
-		if grep -q "${RATOS_PRINTER_DATA_DIR}/logs/ratos-configurator.log" /etc/logrotate.d/ratos-configurator; then
-			report_status "Patching log rotation"
-			sudo sed -i 's|rotate 4|rotate 3|g' /etc/logrotate.d/ratos-configurator
-			sudo sed -i "s|${RATOS_PRINTER_DATA_DIR}/logs/configurator.log|${RATOS_PRINTER_DATA_DIR}/logs/ratos-configurator.log|g" /etc/logrotate.d/ratos-configurator
-		fi
-	else
-		install_logrotation
-	fi
-}
-
-symlink_configuration() {
-	report_status "Symlinking configuration"
-	[ -z "$RATOS_PRINTER_DATA_DIR" ] && { echo "Error: RATOS_PRINTER_DATA_DIR not set" >&2; return 1; }
-	[ -z "$BASE_DIR" ] && { echo "Error: BASE_DIR not set" >&2; return 1; }
-	
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-	
-	target="${RATOS_PRINTER_DATA_DIR}/config/RatOS"
-	source="$BASE_DIR/configuration"
-	if [ ! -L "$target" ] || [ ! "$(readlink "$target")" = "$source" ]; then
-		$sudo rm -rf "$target" || { echo "Failed to remove old configuration" >&2; return 1; }
-		$sudo ln -s "$source" "$target" || { echo "Failed to create symlink" >&2; return 1; }
-		echo "Configuration symlink created successfully"
-	else
-		echo "Configuration already linked, skipping..."
-	fi
-}
-
-install_cli()
-{
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-	
-	target="/usr/local/bin/ratos"
-	source="$SRC_DIR/bin/ratos"
-	if [ ! -L "$target" ] || [ ! "$(readlink "$target")" = "$source" ]; then
-		report_status "Installing RatOS CLI"
-		$sudo rm -f "$target"
-		$sudo ln -s "$source" "$target"
-		$sudo chmod a+x "$target"
-	else
-		echo "RatOS CLI already installed, skipping..."
-	fi
-}
-
-verify_users()
-{
-	if ! id "${RATOS_USERNAME}" &>/dev/null; then
-		echo "User ${RATOS_USERNAME} is not present on the system"
-		exit 1
-	fi
-}
-
-install_udev_rule()
-{
-
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-
-	ratos_source="$SCRIPT_DIR/ratos.rules"
-	ratos_target="/etc/udev/rules.d/97-ratos.rules"
-	if [ ! -f "$ratos_source" ]; then
-		echo "Error: RatOS udev rules source file not found at $ratos_source" >&2
-		return 1
-	fi
-	if [ ! -L "$ratos_target" ] || [ ! "$(readlink "$ratos_target")" = "$ratos_source" ]; then
-		report_status "Installing RatOS udev rule"
-		$sudo rm -f "$ratos_target"
-		$sudo ln -s "$ratos_source" "$ratos_target"
-		echo "RatOS udev rule installed!"
-	fi
-
-	vaoc_source="$SCRIPT_DIR/vaoc.rules" 
-	vaoc_target="/etc/udev/rules.d/97-vaoc.rules"
-	if [ ! -f "$vaoc_source" ]; then
-		echo "Error: VAOC udev rules source file not found at $vaoc_source" >&2
-		return 1
-	fi
-	if [ ! -L "$vaoc_target" ] || [ ! "$(readlink "$vaoc_target")" = "$vaoc_source" ]; then
-		report_status "Installing VAOC udev rule"
-		$sudo rm -f "$vaoc_target"
-		$sudo ln -s "$vaoc_source" "$vaoc_target"
-		echo "VAOC udev rule installed!"
+	if grep "StartLimitIntervalSec=0" /etc/systemd/system/klipperscreen.service &>/dev/null; then
+		report_status "Patching KlipperScreen service restarts..."
+		# Fix restarts
+		$SUDO sed -i 's/\RestartSec=1/\RestartSec=5/g' /etc/systemd/system/KlipperScreen.service
+		$SUDO sed -i 's/\StartLimitIntervalSec=0/\StartLimitIntervalSec=100\nStartLimitBurst=4/g' /etc/systemd/system/KlipperScreen.service
+		$SUDO systemctl daemon-reload
+		echo "KlipperScreen service patched!"
 	fi
 }
 
 ensure_sudo_command_whitelisting()
 {
-
-	sudo=""
-	[ "$EUID" -ne 0 ] && sudo="sudo"
-
     report_status "Updating whitelisted commands"
-	# Whitelist RatOS configurator git hook scripts
-	if [[ -e /etc/sudoers.d/030-ratos-configurator-githooks ]]
+	# Whitelist RatOS git hook scripts
+	if [[ -e /etc/sudoers.d/030-ratos-githooks ]]
 	then
-		$sudo rm /etc/sudoers.d/030-ratos-configurator-githooks
+		$SUDO rm /etc/sudoers.d/030-ratos-githooks
 	fi
-	touch /tmp/030-ratos-configurator-githooks
-	cat << __EOF > /tmp/030-ratos-configurator-githooks
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/update.sh
-__EOF
+	touch /tmp/030-ratos-githooks
+	cat <<EOF > /tmp/030-ratos-githooks
+${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: ${RATOS_PRINTER_DATA_DIR}/config/RatOS/scripts/ratos-update.sh
+${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: ${RATOS_PRINTER_DATA_DIR}/config/RatOS/scripts/klipper-mcu-update.sh
+${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: ${RATOS_PRINTER_DATA_DIR}/config/RatOS/scripts/beacon-update.sh
+${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: ${RATOS_PRINTER_DATA_DIR}/config/RatOS/scripts/moonraker-update.sh
+EOF
 
-	$sudo chown root:root /tmp/030-ratos-configurator-githooks
-	$sudo chmod 440 /tmp/030-ratos-configurator-githooks
-	$sudo cp --preserve=mode /tmp/030-ratos-configurator-githooks /etc/sudoers.d/030-ratos-configurator-githooks
+	$SUDO chown root:root /tmp/030-ratos-githooks
+	$SUDO chmod 440 /tmp/030-ratos-githooks
+	$SUDO cp --preserve=mode /tmp/030-ratos-githooks /etc/sudoers.d/030-ratos-githooks
 
-	echo "RatOS configurator git hooks has successfully been whitelisted!"
-
-	# Whitelist configurator scripts
-	if [[ -e /etc/sudoers.d/030-ratos-configurator-scripts ]]
-	then
-		$sudo rm /etc/sudoers.d/030-ratos-configurator-scripts
-	fi
-	touch /tmp/030-ratos-configurator-scripts
-	cat << __EOF > /tmp/031-ratos-configurator-scripts
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/add-wifi-network.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/change-hostname.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/dfu-flash.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/board-script.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/flash-path.sh
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: $SCRIPT_DIR/klipper-compile.sh
-__EOF
-
-	$sudo chown root:root /tmp/031-ratos-configurator-scripts
-	$sudo chmod 440 /tmp/031-ratos-configurator-scripts
-	$sudo cp --preserve=mode /tmp/031-ratos-configurator-scripts /etc/sudoers.d/031-ratos-configurator-scripts
-
-	echo "RatOS configurator scripts has successfully been whitelisted!"
-
-	# Whitelist configurator commands
-	if [[ -e /etc/sudoers.d/031-ratos-configurator-wifi ]]
-	then
-		$sudo rm /etc/sudoers.d/031-ratos-configurator-wifi
-	fi
-	touch /tmp/031-ratos-configurator-wifi
-	cat << __EOF > /tmp/031-ratos-configurator-wifi
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: /usr/sbin/iw
-${RATOS_USERNAME}  ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli
-__EOF
-
-	$sudo chown root:root /tmp/031-ratos-configurator-wifi
-	$sudo chmod 440 /tmp/031-ratos-configurator-wifi
-	$sudo cp --preserve=mode /tmp/031-ratos-configurator-wifi /etc/sudoers.d/031-ratos-configurator-wifi
-
-	echo "RatOS configurator commands has successfully been whitelisted!"
+	echo "RatOS git hooks has successfully been whitelisted!"
 }
+
+verify_registered_extensions()
+{
+    report_status "Verifying registered Klipper extensions..."
+
+	RATOS_USER_HOME=$(getent passwd "${RATOS_USERNAME}" | cut -d: -f6)
+
+    # Define expected extensions and their relative paths
+    declare -A expected_extensions=(
+        ["beacon"]=$(realpath "${BEACON_DIR}/beacon.py")
+        ["gcode_shell_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/gcode_shell_command.py")
+        ["ratos_homing_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/ratos_homing.py")
+		["linear_movement_analysis"]=$(realpath "${RATOS_USER_HOME}/klipper_linear_movement_analysis/linear_movement_vibrations.py")
+        ["z_offset_probe_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/z_offset_probe.py")
+        ["resonance_generator_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/resonance_generator.py")
+        ["ratos_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/ratos.py")
+        ["beacon_mesh_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/beacon_mesh.py")
+		["beacon_true_zero_correction_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/beacon_true_zero_correction.py")
+		["beacon_adaptive_heatsoak_extension"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/beacon_adaptive_heat_soak.py")
+		["fastconfig"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/fastconfig.py")
+		["named_offsets"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/named_offsets.py")
+		["beacon_user_z_offset"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/beacon_user_z_offset.py")
+    )
+
+	declare -A kinematics_extensions=(
+		["ratos_hybrid_corexy"]=$(realpath "${RATOS_PRINTER_DATA_DIR}/config/RatOS/klippy/kinematics/ratos_hybrid_corexy.py")
+	)
+
+	declare -A expected_moonraker_extensions=(
+		["timelapse"]=$(realpath "${RATOS_USER_HOME}/moonraker-timelapse/component/timelapse.py")
+	)
+
+    # Track found extensions
+    declare -A found_extensions
+    declare -A found_kinematics
+	declare -A found_moonraker_extensions
+    
+	declare extension_type="klipper"
+
+	# Check registered extensions
+    while IFS= read -r line; do
+        # Skip empty lines and check headers
+        [[ -z "$line" ]] && continue
+        if [[ "$line" == *"Registered Klipper Extensions:"* ]]; then
+			extension_type="klipper"
+			continue
+		fi
+        if [[ "$line" == *"Registered Moonraker"* ]]; then
+			extension_type="moonraker"
+			continue
+		fi
+
+        # Extract extension name and filepath
+        if [[ "$line" =~ [[:space:]]*([A-Za-z0-9_]+)[[:space:]]*-\>[[:space:]]*([^[:space:]].+)[[:space:]]*$ ]]; then
+            ext_name="${BASH_REMATCH[1]}"
+            filepath="${BASH_REMATCH[2]}"
+
+			# Check if it's a kinematics extension
+			if [[ -v kinematics_extensions["$ext_name"] ]]; then
+				found_kinematics["$ext_name"]=1
+
+				# Check if filepath matches expected path
+				if [[ "$filepath" != "${kinematics_extensions[$ext_name]}" ]]; then
+					echo "WARNING: Kinematics extension $ext_name has unexpected filepath:"
+					echo "  Expected: ${kinematics_extensions[$ext_name]}"
+					echo "  Found: $filepath"
+					echo "Removing extension $ext_name..."
+					ratos extensions unregister klipper "$ext_name"
+					echo "Reregistering extension $ext_name..."
+					EXT_PATH="${kinematics_extensions[$ext_name]}"
+					ratos extensions register klipper -k "$ext_name" "$EXT_PATH" "$EXT_FILE"
+				fi
+				continue
+			fi
+
+			# Mark as found
+			if [[ "$extension_type" == "klipper" ]]; then
+				found_extensions["$ext_name"]=1
+			fi
+			if [[ "$extension_type" == "moonraker" ]]; then
+				found_moonraker_extensions["$ext_name"]=1
+			fi
+
+			# Check if extension is expected
+			if [[ ! -v expected_extensions["$ext_name"] ]] && [[ ! -v expected_moonraker_extensions["$ext_name"] ]]; then
+				echo "WARNING: Unexpected $extension_type extension found: $ext_name. This may have been registered by a third party."
+				echo "To remove the extension, run 'ratos extensions unregister $extension_type $ext_name'"
+				continue
+			fi
+
+			# Check if filepath matches expected path
+			if [[ "$filepath" != "${expected_extensions[$ext_name]}" ]] && [[ "$filepath" != "${expected_moonraker_extensions[$ext_name]}" ]]; then
+				echo "WARNING: Extension $ext_name has unexpected filepath:"
+				echo "  Expected: ${expected_extensions[$ext_name]}"
+				echo "  Found: $filepath"
+				echo "Removing $extension_type extension $ext_name..."
+				ratos extensions unregister "$extension_type" "$ext_name"
+				echo "Reregistering $extension_type extension $ext_name..."
+				EXT_PATH="${expected_extensions[$ext_name]}"
+				ratos extensions register "$extension_type" "$ext_name" "$EXT_PATH"
+			fi
+
+			# Check if file exists
+			if [ ! -f "$filepath" ]; then
+				echo "WARNING: Extension file not found: $filepath. If you keep seeing this message, please report it to RatOS maintainers."
+				echo "Unregistering $extension_type extension $ext_name..."
+				ratos extensions unregister "$extension_type" "$ext_name"
+			fi
+        fi
+    done < <(ratos extensions list --non-interactive)
+
+    # Check for missing expected extensions
+    for ext_name in "${!expected_extensions[@]}"; do
+        if [[ ! -v found_extensions["$ext_name"] ]]; then
+            echo "Expected klipper extension not registered: $ext_name"
+			echo "Registering extension $ext_name..."
+			EXT_PATH="${expected_extensions[$ext_name]}"
+			ratos extensions register klipper "$ext_name" "$EXT_PATH"
+        else
+			echo "Klipper extension $ext_name is properly registered."
+		fi
+    done
+
+	# Check for missing moonraker extensions
+	for ext_name in "${!expected_moonraker_extensions[@]}"; do
+		if [[ ! -v found_moonraker_extensions["$ext_name"] ]]; then
+			echo "Expected moonraker extension not registered: $ext_name"
+			echo "Registering extension $ext_name..."
+			EXT_PATH="${expected_moonraker_extensions[$ext_name]}"
+			ratos extensions register moonraker "$ext_name" "$EXT_PATH"
+		else
+			echo "Moonraker extension $ext_name is properly registered."
+		fi
+	done
+
+    # Check for missing kinematics extensions
+    for ext_name in "${!kinematics_extensions[@]}"; do
+        if [[ ! -v found_kinematics["$ext_name"] ]]; then
+            echo "Expected klipper kinematics extension not registered: $ext_name"
+			echo "Registering klipper kinematics extension $ext_name..."
+			EXT_PATH="${kinematics_extensions[$ext_name]}"
+			ratos extensions register klipper -k "$ext_name" "$EXT_PATH"
+		else
+			echo "Klipper kinematics extension $ext_name is properly registered."
+		fi
+    done
+}
+
